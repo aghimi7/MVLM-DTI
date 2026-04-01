@@ -1,4 +1,4 @@
-"""
+﻿"""
 eval_phylogeny.py
 
 Evaluates the interpretability of the latent protein manifold by computing 
@@ -21,7 +21,7 @@ class UniversalMVLM(nn.Module):
     def forward(self, p_emb):
         return F.normalize(self.prot_proj(p_emb), dim=-1)
 
-def compute_knn_purity(data_dir="../data", model_path="../models/universal_champion_big.pt", k=5):
+def compute_knn_purity(data_dir="../data", model_path="../models/MVLM_Foundation.pt", k=5):
     print("--- COMPUTING MANIFOLD K-NN PURITY ---")
     
     prot_map = pd.read_csv(os.path.join(data_dir, "final_protein_map.csv"))

@@ -1,4 +1,4 @@
-"""
+﻿"""
 create_strict_splits.py
 
 Removes data leakage between the Universal Foundation Set (BindingDB)

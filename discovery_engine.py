@@ -1,4 +1,4 @@
-"""
+﻿"""
 discovery_engine.py
 
 Systematic inference engine utilizing the Multi-View Linear Manifold (MVLM).
@@ -29,7 +29,7 @@ class UniversalMVLM(nn.Module):
         return torch.sum(d_p * p_p, dim=1)
 
 class KinomeDiscoveryEngine:
-    def __init__(self, model_path="models/universal_champion_big.pt", data_dir="data"):
+    def __init__(self, model_path="models/MVLM_Foundation.pt", data_dir="data"):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Load Encoders

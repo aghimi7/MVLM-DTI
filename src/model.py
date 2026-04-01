@@ -1,4 +1,4 @@
-"""
+﻿"""
 model.py
 
 Defines the Multi-View Linear Manifold (MVLM) architecture and the 

@@ -1,4 +1,4 @@
-# MVLM-DTI: Multi-View Linear Manifold for Drug-Target Interaction
+﻿# MVLM-DTI: Multi-View Linear Manifold for Drug-Target Interaction
 
 Official implementation of our manuscript detailing the **Multi-View Linear Manifold (MVLM)**. This repository provides the source code and inference engine to align pre-trained chemical and proteomic latent spaces for highly accurate, mathematically interpretable drug-target interaction prediction.
 

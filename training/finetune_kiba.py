@@ -1,4 +1,4 @@
-"""
+﻿"""
 finetune_kiba.py
 
 Fine-tunes the Universal Foundation Model on the strict KIBA dataset
@@ -39,7 +39,7 @@ def train_ensemble(data_dir="../data", models_dir="../models"):
     train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-    foundation_path = os.path.join(models_dir, "universal_champion_big.pt")
+    foundation_path = os.path.join(models_dir, "MVLM_Foundation.pt")
     seeds =[42, 101, 999]
 
     for seed in seeds:
