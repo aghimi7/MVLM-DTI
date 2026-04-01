@@ -1,17 +1,9 @@
-﻿import os
-import torch
-import numpy as np
-import pandas as pd
-import torch.nn as nn
-import torch.nn.functional as F
+﻿import os, torch, numpy as np, pandas as pd, torch.nn as nn, torch.nn.functional as F
 from sklearn.neighbors import NearestNeighbors
 
 def get_file(filename):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    paths =[
-        os.path.join(base_dir, "data", filename), 
-        os.path.join(base_dir, "models", filename)
-    ]
+    paths =[os.path.join(base_dir, "data", filename), os.path.join(base_dir, "models", filename)]
     for p in paths:
         if os.path.exists(p): return p
     raise FileNotFoundError(f"Could not find {filename}")
@@ -19,8 +11,9 @@ def get_file(filename):
 class UniversalMVLM(nn.Module):
     def __init__(self):
         super().__init__()
+        # EXACT ORIGINAL ARCHITECTURE
         self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512))
-
+        
     def forward(self, p_emb):
         return F.normalize(self.prot_proj(p_emb), dim=-1)
 
@@ -31,11 +24,7 @@ def compute_knn_purity(k=5):
 
     families =[]
     for i, row in prot_map.iterrows():
-        name = ""
-        for col in['Entry Name', 'Gene Names', 'Target_ID', 'Name']:
-            if col in row and pd.notna(row[col]):
-                name += str(row[col]).upper()
-        
+        name = "".join([str(row[c]).upper() for c in['Entry Name', 'Gene Names', 'Target_ID'] if c in row and pd.notna(row[c])])
         if 'CDK' in name or 'MAPK' in name: families.append('CMGC')
         elif 'PKC' in name: families.append('AGC')
         elif any(x in name for x in['SRC', 'EGF', 'FGF', 'JAK']): families.append('TK')
@@ -46,6 +35,7 @@ def compute_knn_purity(k=5):
     model = UniversalMVLM()
     state_dict = torch.load(get_file("MVLM_Foundation.pt"), map_location='cpu')
     
+    # Safely extract only the protein projection weights
     clean_dict = {}
     for key, val in state_dict.items():
         k_clean = key.replace("module.", "")
@@ -64,19 +54,15 @@ def compute_knn_purity(k=5):
     _, indices = nn_model.kneighbors(projected)
     neighbor_indices = indices[:, 1:]
     
-    family_labels = np.array(families)
+    fam_arr = np.array(families)
     purities, tk_p, cmgc_p = [], [],[]
 
     for i, neighbors in enumerate(neighbor_indices):
-        true_family = family_labels[i]
-        if true_family == 'Other': continue
-            
-        matches = np.sum(family_labels[neighbors] == true_family)
-        purity = matches / k
-        
-        purities.append(purity)
-        if true_family == 'TK': tk_p.append(purity)
-        elif true_family == 'CMGC': cmgc_p.append(purity)
+        if fam_arr[i] == 'Other': continue
+        p = np.sum(fam_arr[neighbors] == fam_arr[i]) / k
+        purities.append(p)
+        if fam_arr[i] == 'TK': tk_p.append(p)
+        elif fam_arr[i] == 'CMGC': cmgc_p.append(p)
 
     print(f"\n[Phylogenetic Clustering Results (k={k})]")
     print(f"Global Purity: {np.mean(purities)*100:.1f}%")
