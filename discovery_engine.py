@@ -23,20 +23,18 @@ def get_file(filename):
 class UniversalMVLM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.drug_proj = nn.utils.spectral_norm(nn.Linear(768, 512, bias=False))
-        self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512, bias=False))
-        self.ln_d = nn.LayerNorm(512)
-        self.ln_p = nn.LayerNorm(512)
+        # EXACT architecture of the Foundation Model (with biases, NO LayerNorm)
+        self.drug_proj = nn.utils.spectral_norm(nn.Linear(768, 512))
+        self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512))
 
     def forward(self, d_emb, p_emb):
-        d_p = F.normalize(self.ln_d(self.drug_proj(d_emb)), dim=-1)
-        p_p = F.normalize(self.ln_p(self.prot_proj(p_emb)), dim=-1)
+        d_p = F.normalize(self.drug_proj(d_emb), dim=-1)
+        p_p = F.normalize(self.prot_proj(p_emb), dim=-1)
         return torch.sum(d_p * p_p, dim=1)
 
 class KinomeDiscoveryEngine:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
         self.tokenizer = AutoTokenizer.from_pretrained("DeepChem/ChemBERTa-77M-MLM")
         self.chemberta = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MLM").to(self.device)
         self.chemberta.eval()
@@ -47,12 +45,14 @@ class KinomeDiscoveryEngine:
 
         self.model = UniversalMVLM().to(self.device)
         state_dict = torch.load(get_file("MVLM_Foundation.pt"), map_location=self.device)
-        state_dict = {k.replace("module.", "").replace("U", "drug_proj").replace("V", "prot_proj"): v for k, v in state_dict.items()}
-        self.model.load_state_dict(state_dict, strict=False)
+        
+        # Clean dictionary keys
+        clean_state = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        self.model.load_state_dict(clean_state, strict=False)
         self.model.eval()
 
         with torch.no_grad():
-            self.p_proj = F.normalize(self.model.ln_p(self.model.prot_proj(self.p_tensor)), dim=-1)
+            self.p_proj = F.normalize(self.model.prot_proj(self.p_tensor), dim=-1)
 
     def predict(self, smiles, top_k=5):
         with torch.no_grad():
@@ -60,13 +60,13 @@ class KinomeDiscoveryEngine:
             out = self.chemberta(**inp)
             d_emb = torch.cat([out.last_hidden_state[:, 0, :], torch.mean(out.last_hidden_state, dim=1)], dim=1)
             
-            d_proj = F.normalize(self.model.ln_d(self.model.drug_proj(d_emb)), dim=-1)
+            d_proj = F.normalize(self.model.drug_proj(d_emb), dim=-1)
             scores = torch.matmul(d_proj, self.p_proj.T).squeeze(0)
             probs = torch.sigmoid(scores / 0.07).cpu().numpy()
 
         ranked_indices = np.argsort(probs)[::-1]
         
-        results =[]
+        results = []
         for idx in ranked_indices[:top_k]:
             target_id = self.prot_map.iloc[idx].get('Target_ID', self.prot_map.iloc[idx].get('Entry Name', 'Unknown'))
             results.append((target_id, probs[idx]))

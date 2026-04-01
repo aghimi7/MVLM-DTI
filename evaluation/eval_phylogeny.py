@@ -8,7 +8,10 @@ from sklearn.neighbors import NearestNeighbors
 
 def get_file(filename):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    paths =[os.path.join(base_dir, "data", filename), os.path.join(base_dir, "models", filename)]
+    paths =[
+        os.path.join(base_dir, "data", filename), 
+        os.path.join(base_dir, "models", filename)
+    ]
     for p in paths:
         if os.path.exists(p): return p
     raise FileNotFoundError(f"Could not find {filename}")
@@ -16,11 +19,10 @@ def get_file(filename):
 class UniversalMVLM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512, bias=False))
-        self.ln_p = nn.LayerNorm(512)
+        self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512))
 
     def forward(self, p_emb):
-        return F.normalize(self.ln_p(self.prot_proj(p_emb)), dim=-1)
+        return F.normalize(self.prot_proj(p_emb), dim=-1)
 
 def compute_knn_purity(k=5):
     print("--- COMPUTING MANIFOLD K-NN PURITY ---")
@@ -30,21 +32,27 @@ def compute_knn_purity(k=5):
     families =[]
     for i, row in prot_map.iterrows():
         name = ""
-        for col in ['Entry Name', 'Gene Names', 'Target_ID', 'Name']:
+        for col in['Entry Name', 'Gene Names', 'Target_ID', 'Name']:
             if col in row and pd.notna(row[col]):
                 name += str(row[col]).upper()
         
         if 'CDK' in name or 'MAPK' in name: families.append('CMGC')
         elif 'PKC' in name: families.append('AGC')
-        elif 'SRC' in name or 'EGF' in name or 'FGF' in name or 'JAK' in name: families.append('TK')
+        elif any(x in name for x in['SRC', 'EGF', 'FGF', 'JAK']): families.append('TK')
         else: families.append('Other')
     
     prot_map['Family'] = families
 
     model = UniversalMVLM()
     state_dict = torch.load(get_file("MVLM_Foundation.pt"), map_location='cpu')
-    state_dict = {k.replace("module.", "").replace("V", "prot_proj"): v for k, v in state_dict.items() if 'V' in k or 'ln_p' in k}
-    model.load_state_dict(state_dict, strict=False)
+    
+    clean_dict = {}
+    for key, val in state_dict.items():
+        k_clean = key.replace("module.", "")
+        if 'prot_proj' in k_clean:
+            clean_dict[k_clean] = val
+            
+    model.load_state_dict(clean_dict, strict=False)
     model.eval()
 
     with torch.no_grad():
@@ -57,7 +65,7 @@ def compute_knn_purity(k=5):
     neighbor_indices = indices[:, 1:]
     
     family_labels = np.array(families)
-    purities, tk_purities, cmgc_purities = [], [], []
+    purities, tk_p, cmgc_p = [], [],[]
 
     for i, neighbors in enumerate(neighbor_indices):
         true_family = family_labels[i]
@@ -67,13 +75,13 @@ def compute_knn_purity(k=5):
         purity = matches / k
         
         purities.append(purity)
-        if true_family == 'TK': tk_purities.append(purity)
-        elif true_family == 'CMGC': cmgc_purities.append(purity)
+        if true_family == 'TK': tk_p.append(purity)
+        elif true_family == 'CMGC': cmgc_p.append(purity)
 
     print(f"\n[Phylogenetic Clustering Results (k={k})]")
     print(f"Global Purity: {np.mean(purities)*100:.1f}%")
-    print(f"TK Family:     {np.mean(tk_purities)*100:.1f}%")
-    print(f"CMGC Family:   {np.mean(cmgc_purities)*100:.1f}%")
+    print(f"TK Family:     {np.mean(tk_p)*100:.1f}%")
+    print(f"CMGC Family:   {np.mean(cmgc_p)*100:.1f}%")
 
 if __name__ == "__main__":
     compute_knn_purity()
