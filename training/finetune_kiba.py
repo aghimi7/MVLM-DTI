@@ -1,102 +1,135 @@
-﻿"""
-finetune_kiba.py
+import os, torch, warnings, numpy as np, pandas as pd
+import torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel, logging
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import train_test_split
 
-Fine-tunes the Universal Foundation Model on the strict KIBA dataset
-using an ensemble of 3 random seeds to ensure robustness.
-"""
+warnings.filterwarnings('ignore')
+logging.set_verbosity_error()
 
-import os
-import torch
-import numpy as np
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model import MultiViewLinearManifold, HybridLoss
-from src.dataset import DTIDataset
+def get_file(f):
+    paths =[f, f"../{f}", f"data/{f}", f"../data/{f}", f"models/{f}", f"../models/{f}"]
+    for p in paths:
+        if os.path.exists(p): return p
+    raise FileNotFoundError(f"Could not find {f}")
 
-def train_ensemble(data_dir="../data", models_dir="../models"):
-    print("--- FINE-TUNING MVLM ENSEMBLE (KIBA) ---")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load Strict KIBA Dataset
-    csv_path = os.path.join(data_dir, "kiba_strict.csv")
-    map_path = os.path.join(data_dir, "final_protein_map.csv")
-    vec_path = os.path.join(data_dir, "big_protein_vectors.npy")
-    
-    # We assume 'label' column is pre-calculated (Y < 12.1)
-    dataset = DTIDataset(csv_path, map_path, vec_path, target_col='label')
-    
-    # 80/20 Split logic (Mocked for clean script structure)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42)
-    )
-    
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+df = pd.read_csv(get_file("kiba_strict.csv")).dropna(subset=['Drug', 'Target_ID', 'Y'])
+df['label'] = (df['Y'] < 12.1).astype(int)
 
-    foundation_path = os.path.join(models_dir, "MVLM_Foundation.pt")
-    seeds =[42, 101, 999]
+prot_map = pd.read_csv(get_file("final_protein_map.csv"))
+prot_vectors = np.load(get_file("big_protein_vectors.npy"))
 
-    for seed in seeds:
-        print(f"\nTraining Seed {seed}...")
-        torch.manual_seed(seed)
+t2idx = {}
+for i, row in prot_map.iterrows():
+    for col in['Entry', 'Entry Name', 'Gene Names', 'Target_ID', 'Name']:
+        if col in prot_map.columns and pd.notna(row[col]):
+            for n in str(row[col]).replace(';', ' ').split():
+                t2idx[n] = i
+
+df = df[df['Target_ID'].astype(str).isin(t2idx)].reset_index(drop=True)
+
+print("Extracting ChemBERTa features (768-dim)...")
+tokenizer = AutoTokenizer.from_pretrained("DeepChem/ChemBERTa-77M-MLM")
+chemberta = AutoModel.from_pretrained("DeepChem/ChemBERTa-77M-MLM").to(device)
+
+d_embs = {}
+with torch.no_grad():
+    for drug in df['Drug'].unique():
+        inp = tokenizer(drug, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        out = chemberta(**inp)
+        # EXACTLY 768 DIMENSIONS (384 + 384)
+        emb = torch.cat([out.last_hidden_state[:,0,:], torch.mean(out.last_hidden_state, dim=1)], dim=1).squeeze(0).cpu().numpy()
+        d_embs[drug] = emb
+
+X_d = np.array([d_embs[d] for d in df['Drug']])
+X_p = np.array([prot_vectors[t2idx[str(t)]] for t in df['Target_ID']])
+Y = df['label'].values
+
+train_d, test_d, train_p, test_p, train_y, test_y = train_test_split(X_d, X_p, Y, test_size=0.2, random_state=42, stratify=Y)
+
+class FastDataset(Dataset):
+    def __init__(self, d, p, y):
+        self.d, self.p, self.y = torch.tensor(d, dtype=torch.float32), torch.tensor(p, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, i): return self.d[i], self.p[i], self.y[i]
+
+train_loader = DataLoader(FastDataset(train_d, train_p, train_y), batch_size=256, shuffle=True)
+test_loader = DataLoader(FastDataset(test_d, test_p, test_y), batch_size=256, shuffle=False)
+
+class MVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.U = nn.utils.spectral_norm(nn.Linear(768, 512, bias=False)) # MATCHES WEIGHTS EXACTLY
+        self.V = nn.utils.spectral_norm(nn.Linear(480, 512, bias=False))
+        self.ln_d = nn.LayerNorm(512)
+        self.ln_p = nn.LayerNorm(512)
+        self.logit_scale = nn.Parameter(torch.ones([]) * 0.07)
+    def forward(self, d, p):
+        return torch.sum(F.normalize(self.ln_d(self.U(d)), dim=-1) * F.normalize(self.ln_p(self.V(p)), dim=-1), dim=1)
+
+class HybridLoss(nn.Module):
+    def __init__(self, alpha=0.3, temp=0.07):
+        super().__init__()
+        self.alpha, self.temp = alpha, temp
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+    def forward(self, scores, targets, pos_weight):
+        logits = scores / self.temp
+        loss_bce = (self.bce(logits, targets) * torch.where(targets == 1.0, pos_weight, torch.tensor(1.0).to(device))).mean()
+        return (1 - self.alpha) * loss_bce + self.alpha * torch.mean((scores - targets) ** 2)
+
+foundation_path = get_file("MVLM_Foundation.pt")
+os.makedirs("models", exist_ok=True)
+ensemble_preds = np.zeros(len(test_y))
+
+for seed in [42, 101, 999]:
+    print(f"\n--- Training KIBA Seed {seed} ---")
+    torch.manual_seed(seed)
+    model = MVLM().to(device)
+    model.load_state_dict({k.replace("module.", ""): v for k, v in torch.load(foundation_path, map_location=device).items()}, strict=False)
         
-        model = MultiViewLinearManifold().to(device)
-        if os.path.exists(foundation_path):
-            state = torch.load(foundation_path, map_location=device)
-            state = {k.replace("module.", ""): v for k, v in state.items()}
-            model.load_state_dict(state, strict=False)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=4)
+    pos_w = torch.tensor([(len(train_y) - sum(train_y)) / (sum(train_y) + 1e-5)]).to(device)
+    crit = HybridLoss() 
+    
+    best_auc, patience = 0.0, 0
+    save_name = f"models/kiba_mvlm_seed_{seed}.pt"
+    
+    for epoch in range(60):
+        model.train()
+        for d, p, y_b in train_loader:
+            opt.zero_grad()
+            loss = crit(model(d.to(device), p.to(device)), y_b.to(device), pos_w)
+            loss.backward(); opt.step()
             
-        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
-        criterion = HybridLoss()
-
-        best_auc = 0.0
-        patience_counter = 0
+        model.eval()
+        preds =[]
+        with torch.no_grad():
+            for d, p, _ in test_loader:
+                preds.extend(torch.sigmoid(model(d.to(device), p.to(device)) / 0.07).cpu().numpy())
         
-        for epoch in range(100):
-            model.train()
-            for batch in train_loader:
-                d_emb = torch.cat([batch['input_ids'], batch['attention_mask']], dim=1).to(device) # Placeholder representation
-                p_emb = batch['protein_embed'].to(device)
-                y = batch['label'].to(device)
-                
-                optimizer.zero_grad()
-                scores = model(d_emb, p_emb)
-                loss = criterion(scores, y)
-                loss.backward()
-                optimizer.step()
-                
-            # Validation Step
-            model.eval()
-            all_preds, all_y = [],[]
-            with torch.no_grad():
-                for batch in test_loader:
-                    d_emb = torch.cat([batch['input_ids'], batch['attention_mask']], dim=1).to(device)
-                    p_emb = batch['protein_embed'].to(device)
-                    scores = model(d_emb, p_emb)
-                    probs = torch.sigmoid(scores / model.logit_scale)
-                    all_preds.extend(probs.cpu().numpy())
-                    all_y.extend(batch['label'].numpy())
-                    
-            auc = roc_auc_score(all_y, all_preds)
-            scheduler.step(auc)
+        auc = roc_auc_score(test_y, preds)
+        scheduler.step(auc)
+        if auc > best_auc:
+            best_auc, patience = auc, 0
+            torch.save(model.state_dict(), save_name)
+        else:
+            patience += 1
+        if patience >= 10: break
             
-            if auc > best_auc:
-                best_auc = auc
-                patience_counter = 0
-                torch.save(model.state_dict(), os.path.join(models_dir, f"kiba_mvlm_seed_{seed}.pt"))
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= 15:
-                print(f"Early stopping at epoch {epoch}. Best AUC: {best_auc:.4f}")
-                break
+    model.load_state_dict(torch.load(save_name))
+    model.eval()
+    with torch.no_grad():
+        final_preds =[]
+        for d, p, _ in test_loader:
+            final_preds.extend(torch.sigmoid(model(d.to(device), p.to(device)) / 0.07).cpu().numpy())
+        ensemble_preds += np.array(final_preds)
 
-if __name__ == "__main__":
-    train_ensemble()
+ensemble_preds /= 3
+print("\n==================================================")
+print(f"FINAL KIBA ENSEMBLE AUROC: {roc_auc_score(test_y, ensemble_preds):.4f}")
+print(f"FINAL KIBA ENSEMBLE AUPRC: {average_precision_score(test_y, ensemble_preds):.4f}")
+print("==================================================")

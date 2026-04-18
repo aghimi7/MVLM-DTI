@@ -1,6 +1,8 @@
 ﻿import os, torch, numpy as np, pandas as pd, torch.nn as nn, torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel, logging
+from rdkit import Chem
 import warnings
+
 warnings.filterwarnings('ignore')
 logging.set_verbosity_error()
 
@@ -13,17 +15,18 @@ def get_file(filename):
         if os.path.exists(p): return p
     raise FileNotFoundError(f"Could not find {filename}")
 
-class MVLM(nn.Module):
+class UniversalMVLM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.U = nn.Linear(768, 512, bias=False)
-        self.V = nn.Linear(480, 512, bias=False)
+        self.drug_proj = nn.utils.spectral_norm(nn.Linear(768, 512, bias=False))
+        self.prot_proj = nn.utils.spectral_norm(nn.Linear(480, 512, bias=False))
         self.ln_d = nn.LayerNorm(512)
         self.ln_p = nn.LayerNorm(512)
+        self.logit_scale = nn.Parameter(torch.ones([]) * 0.07)
 
-    def forward(self, d_emb, p_emb):
-        d_p = F.normalize(self.ln_d(self.U(d_emb)), dim=-1)
-        p_p = F.normalize(self.ln_p(self.V(p_emb)), dim=-1)
+    def forward(self, d, p):
+        d_p = F.normalize(self.ln_d(self.drug_proj(d)), dim=-1)
+        p_p = F.normalize(self.ln_p(self.prot_proj(p)), dim=-1)
         return torch.sum(d_p * p_p, dim=1)
 
 class KinomeDiscoveryEngine:
@@ -36,25 +39,31 @@ class KinomeDiscoveryEngine:
         prot_vectors = np.load(get_file("big_protein_vectors.npy"))
         self.p_tensor = torch.tensor(prot_vectors, dtype=torch.float32).to(device)
 
-        self.model = MVLM().to(device)
-        # Load the reliable DeepChem-trained model
-        state_dict = torch.load(get_file("kiba_mvlm_seed_42.pt"), map_location=device)
+        self.model = UniversalMVLM().to(device)
+        state_dict = torch.load(get_file("MVLM_Foundation.pt"), map_location=device)
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
         self.model.load_state_dict(state_dict, strict=False)
         self.model.eval()
 
         with torch.no_grad():
-            self.p_proj = F.normalize(self.model.ln_p(self.model.V(self.p_tensor)), dim=-1)
+            self.p_proj = F.normalize(self.model.ln_p(self.model.prot_proj(self.p_tensor)), dim=-1)
 
     def predict(self, smiles, top_k=5):
+        # Apply RDKit Canonicalization for strict topological consistency
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            canon_smiles = Chem.MolToSmiles(mol)
+        except:
+            canon_smiles = smiles
+
         with torch.no_grad():
-            inp = self.tokenizer(smiles, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+            inp = self.tokenizer(canon_smiles, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
             out = self.chemberta(**inp)
             d_emb = torch.cat([out.last_hidden_state[:, 0, :], torch.mean(out.last_hidden_state, dim=1)], dim=1)
             
-            d_proj = F.normalize(self.model.ln_d(self.model.U(d_emb)), dim=-1)
+            d_proj = F.normalize(self.model.ln_d(self.model.drug_proj(d_emb)), dim=-1)
             scores = torch.matmul(d_proj, self.p_proj.T).squeeze(0)
-            probs = torch.sigmoid(scores / 0.07).cpu().numpy()
+            probs = torch.sigmoid(scores / self.model.logit_scale).cpu().numpy()
 
         ranked_indices = np.argsort(probs)[::-1]
         results = []
