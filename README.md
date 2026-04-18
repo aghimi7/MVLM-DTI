@@ -43,7 +43,6 @@ PDGFRA          | 0.9712
 *   `data/`: Contains structural maps, protein vectors, and strict benchmark splits.
 *   `models/`: Contains the `.pt` checkpoints for the linear projection matrices.
 *   `src/`: Core model definitions (MVLM architecture and Hybrid Loss).
-*   `evaluation/`: Scripts to reproduce paper analyses (e.g., k-NN phylogeny, McNemar's test).
 *   `data_processing/`: Scripts demonstrating strict cold-drug data splitting.
 
 ## Citation
